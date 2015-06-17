@@ -19,6 +19,7 @@ import gettext
 import threading
 import time
 import eventlet
+import sys
 
 gettext.install('contrail_vif')
 
@@ -63,10 +64,16 @@ compute_mgr = None
 
 # MonkeyPatch the vif_driver with VRouterVIFDriver during restart of nova-compute
 def patched_get_nw_info_for_instance(instance):
-    if not isinstance(compute_mgr.driver.vif_driver, VRouterVIFDriver):
-        compute_mgr.driver.vif_driver = \
-            VRouterVIFDriver(compute_mgr.driver._get_connection)
+#    if not isinstance(compute_mgr.driver.vif_driver, VRouterVIFDriver):
+#        compute_mgr.driver.vif_driver = \
+#            VRouterVIFDriver(compute_mgr.driver._get_connection)
+#    return orig_get_nw_info_for_instance(instance)
+    if any(['nova-compute' in arg for arg in sys.argv]):
+        if not isinstance(compute_mgr.driver.vif_driver, VRouterVIFDriver):
+            compute_mgr.driver.vif_driver = \
+                VRouterVIFDriver(compute_mgr.driver._get_connection)
     return orig_get_nw_info_for_instance(instance)
+
 
 class ContrailNetworkAPI(API):
     def __init__(self):
@@ -79,11 +86,21 @@ class ContrailNetworkAPI(API):
         # Store the compute manager object to overwrite vif_driver
         import inspect
         global compute_mgr
-        compute_mgr = inspect.stack()[2][0].f_locals['self']
-        if not isinstance(compute_mgr, ComputeManager):
-            compute_mgr = inspect.stack()[5][0].f_locals['self']
-        if not isinstance(compute_mgr, ComputeManager):
-            raise BadRequest("Can't get hold of compute manager");
+        if any(['nova-compute' in arg for arg in sys.argv]):
+            LOG.debug('running patch')
+            # patch only for nova-compute
+            compute_mgr = inspect.stack()[2][0].f_locals.get('self')
+            if not isinstance(compute_mgr, ComputeManager):
+                #import pdb; pdb.set_trace()
+                compute_mgr = inspect.stack()[5][0].f_locals.get('self')
+            if not isinstance(compute_mgr, ComputeManager):
+                raise BadRequest("Can't get hold of compute manager")
+        
+        #compute_mgr = inspect.stack()[2][0].f_locals['self']   
+        #if not isinstance(compute_mgr, ComputeManager):
+        #    compute_mgr = inspect.stack()[5][0].f_locals['self']
+        #if not isinstance(compute_mgr, ComputeManager):
+        #    raise BadRequest("Can't get hold of compute manager");
         super(ContrailNetworkAPI, self).__init__()
     #end __init__
 
@@ -164,81 +181,68 @@ class VRouterVIFDriver(LibVirtVIFDriver):
         return conf
 
     def plug(self, instance, vif):
+        dev = self.get_vif_devname(vif)
+
         try:
-            dev = self.get_vif_devname(vif)
+            linux_net.create_tap_dev(dev)
+        except processutils.ProcessExecutionError:
+            LOG.exception(_LE("Failed while plugging vif"), instance=instance)
 
-            try:
-                linux_net.create_tap_dev(dev)
-            except processutils.ProcessExecutionError:
-                LOG.exception(_LE("Failed while plugging vif"), instance=instance)
+        try:
+            virt_type = cfg.CONF.libvirt.virt_type
+        except cfg.NoSuchOptError:
+            virt_type = cfg.CONF.libvirt_type
 
-            try:
-                virt_type = cfg.CONF.libvirt.virt_type
-            except cfg.NoSuchOptError:
-                virt_type = cfg.CONF.libvirt_type
+        if virt_type == 'lxc':
+            dev = self._create_bridge(dev, instance)
 
-            if virt_type == 'lxc':
-                dev = self._create_bridge(dev, instance)
+        ipv4_address = '0.0.0.0'
+        ipv6_address = None
+        subnets = vif['network']['subnets']
+        for subnet in subnets:
+            ips = subnet['ips'][0]
+            if (ips['version'] == 4):
+                if ips['address'] is not None:
+                    ipv4_address = ips['address']
+            if (ips['version'] == 6):
+                if ips['address'] is not None:
+                    ipv6_address = ips['address']
 
-            ipv4_address = '0.0.0.0'
-            ipv6_address = None
-            subnets = vif['network']['subnets']
-            for subnet in subnets:
-                ips = subnet['ips'][0]
-                if (ips['version'] == 4):
-                    if ips['address'] is not None:
-                        ipv4_address = ips['address']
-                if (ips['version'] == 6):
-                    if ips['address'] is not None:
-                        ipv6_address = ips['address']
-
-            kwargs = {
-                'ip_address': ipv4_address,
-                'vn_id': vif['network']['id'],
-                'display_name': instance['display_name'],
-                'hostname': instance['hostname'],
-                'host': instance['host'],
-                'vm_project_id': instance['project_id'],
-                'port_type': self.PORT_TYPE,
-                'ip6_address': ipv6_address,
-            }
-            try:
-                result = self._vrouter_client.add_port(instance['uuid'],
-                                                       vif['id'],
-                                                       dev,
-                                                       vif['address'],
-                                                       **kwargs)
-                if not result:
-                    LOG.exception(_LE("Failed while plugging vif"),
-                                  instance=instance)
-            except TApplicationException:
-                LOG.exception(_LE("Failed while plugging vif"), instance=instance)
-
-        except Exception as e:
-            from pprint import pformat
-            LOG.error(_("Error in plug: %s locals: %s instance %s"
-                       %(str(e), pformat(locals()),
-                         pformat(instance.__dict__))))
+        kwargs = {
+            'ip_address': ipv4_address,
+            'vn_id': vif['network']['id'],
+            'display_name': instance['display_name'],
+            'hostname': instance['hostname'],
+            'host': instance['host'],
+            'vm_project_id': instance['project_id'],
+            'port_type': self.PORT_TYPE,
+            'ip6_address': ipv6_address,
+        }
+        try:
+            result = self._vrouter_client.add_port(instance['uuid'],
+                                                   vif['id'],
+                                                   dev,
+                                                   vif['address'],
+                                                   **kwargs)
+            if not result:
+                LOG.exception(_LE("Failed while plugging vif"),
+                              instance=instance)
+        except TApplicationException:
+            LOG.exception(_LE("Failed while plugging vif"), instance=instance)
 
     def unplug(self, instance, vif):
-        try:
-            dev = self.get_vif_devname(vif)
+        dev = self.get_vif_devname(vif)
 
-            try:
-                self._vrouter_client.delete_port(vif['id'])
-	        #delegate the deletion of tap device to a deffered thread
-                worker_thread = threading.Thread(target=self.delete_device, \
-		    name='contrailvif', args=(dev,))
-	        worker_thread.start()
-            except (TApplicationException, processutils.ProcessExecutionError,\
-	        RuntimeError):
-                LOG.exception(_LE("Failed while unplugging vif"),
-                              instance=instance)
-        except Exception as e:
-            from pprint import pformat
-            LOG.error(_("Error in unplug: %s locals: %s instance %s"
-                       %(str(e), pformat(locals()),
-                         pformat(instance.__dict__))))
+        try:
+            self._vrouter_client.delete_port(vif['id'])
+        #delegate the deletion of tap device to a deffered thread
+            worker_thread = threading.Thread(target=self.delete_device, \
+        name='contrailvif', args=(dev,))
+        worker_thread.start()
+        except (TApplicationException, processutils.ProcessExecutionError,\
+        RuntimeError):
+            LOG.exception(_LE("Failed while unplugging vif"),
+                          instance=instance)
 
     def delete_device(self, dev):
         time.sleep(2)
